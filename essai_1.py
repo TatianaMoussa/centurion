@@ -2,7 +2,7 @@ import fedoo as fd
 import numpy as np
 
 fd.ModelingSpace("3D")
-
+print('mon code marche')
 Rext = 15.0
 Rnuc = 6.0
 H = 10.0
