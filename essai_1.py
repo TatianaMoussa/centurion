@@ -23,7 +23,7 @@ nodes = mesh.nodes
 
 centers = nodes[conn].mean(axis=1)
 r = np.sqrt(centers[:, 0]**2 + centers[:, 1]**2)
-
+print("hiiii")
 elem_nucleus = np.where(r <= Rnuc)[0]
 elem_annulus = np.where(r > Rnuc)[0]
 
