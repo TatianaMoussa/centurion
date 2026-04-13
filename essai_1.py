@@ -1,66 +1,118 @@
 import fedoo as fd
 import numpy as np
 
-fd.ModelingSpace("3D")
-print('mon code marche')
-Rext = 15.0
-Rnuc = 6.0
-H = 10.0
 
-profil = fd.mesh.disk_mesh(
-    radius=Rext,
-    nr=12,
-    nt=36,
-    elm_type="quad4",
-    ndim=None,
-    name="disk2d"
+fd.ModelingSpace("2D")
+
+NLGEOM = "UL"  # updated lagrangian
+
+# parameters
+h = 1
+L = 1
+E = 200e3
+nu = 0.3    # coef. de Poisson
+alpha = 1e-5
+
+
+
+# mesh of the rectangle 
+mesh_rect = fd.mesh.rectangle_mesh(
+    nx=11, ny=21, x_min=0, x_max=L, y_min=0, y_max=h, elm_type="quad4", 
+    name="Domain")
+# on crée un groupe appelé "rect", qui prends tous les indices d'éléments du rectangle(0 --> mesh_rect.n_elements-1)
+mesh_rect.element_sets["rect"] = np.arange(0, mesh_rect.n_elements)
+
+
+# mesh of a disk (small gap for IPC barrier method)
+mesh_disk = fd.mesh.disk_mesh(radius=L / 2, nr=6, nt=6, elm_type="quad4")
+# translate the disk (0.01 gap from rectangle)
+mesh_disk.nodes += np.array([1.51, 0.48])  
+mesh_disk.element_sets["disk"] = np.arange(0, mesh_disk.n_elements)
+# put the two meshes in a single mesh (change the element indices)
+mesh = fd.Mesh.stack(mesh_rect, mesh_disk)
+
+
+
+# node sets for boundary conditions
+nodes_left = mesh.find_nodes("X", 0)
+nodes_bc = mesh.find_nodes("X>1.5")
+nodes_bc = list(set(nodes_bc).intersection(mesh.node_sets["boundary"]))
+
+
+# IPC contact assembly
+surf = fd.mesh.extract_surface(mesh)
+
+#crée la loi de contact (fedoo empêcher les corps de se traverser. )
+contact = fd.constraint.IPCContact(
+    mesh,
+    surface_mesh=surf,
+    dhat=0.005,  #distance seuil 
+    dhat_is_relative=False, # valeur abs
+    use_ccd=True,    #active la détection continue de collision
 )
 
-mesh = fd.mesh.extrude(profil, H, 8)
+# define material for rectangle (elasto-plastic law)
+Re = 300
+k = 1000  # 1500
+m = 0.3  # 0.25
+props = np.array([E, nu, alpha, Re, k, m])
 
-conn = mesh.elements
-nodes = mesh.nodes
 
-centers = nodes[conn].mean(axis=1)
-r = np.sqrt(centers[:, 0]**2 + centers[:, 1]**2)
-print("hiiii")
-elem_nucleus = np.where(r <= Rnuc)[0]
-elem_annulus = np.where(r > Rnuc)[0]
+#Matériaux
+# define an rectangle
+material_rect = fd.constitutivelaw.Simcoon("EPICP", props, name="ConstitutiveLaw")
+# define material for disk (elastic isotropic)
+material_disk = fd.constitutivelaw.ElasticIsotrop(50e3, nu, name="ConstitutiveLaw")
+# define an heterogeneous constitutive law
+material = fd.constitutivelaw.Heterogeneous((material_rect, material_disk), ("rect", "disk"))
 
-mesh_nucleus = mesh.extract_elements(elem_nucleus, name="nucleus")
-mesh_annulus = mesh.extract_elements(elem_annulus, name="annulus")
 
-material_nucleus = fd.constitutivelaw.ElasticIsotrop(1.0, 0.49)
-material_annulus = fd.constitutivelaw.ElasticIsotrop(4.0, 0.45)
 
-wf_nucleus = fd.weakform.StressEquilibrium(material_nucleus)
-wf_annulus = fd.weakform.StressEquilibrium(material_annulus)
+# on construit ici l'éq. d'équilibre mécanique en contraintes
+#NLGEOM = non-linéarité géométrique (ici on active "UL")
+wf = fd.weakform.StressEquilibrium(material, nlgeom=NLGEOM)
+# en crée l'assemblage EF du solide.
+solid_assembly = fd.Assembly.create(wf, mesh)
+# add contact to the global assembly
+assembly = fd.Assembly.sum(solid_assembly, contact)
 
-assembly_nucleus = fd.Assembly.create(wf_nucleus, mesh_nucleus)
-assembly_annulus = fd.Assembly.create(wf_annulus, mesh_annulus)
 
-assembly = assembly_nucleus + assembly_annulus
 
-pb = fd.problem.Linear(assembly)
-pb.set_solver("cg")
+# define non linear analysis
+pb = fd.problem.NonLinear(assembly)
+# add some output that are automatically saved
+results = pb.add_output(
+    "contact_example", solid_assembly, ["Disp", "Stress", "Strain", "P", "Fext"])
 
-zmin = mesh.bounding_box.zmin
-zmax = mesh.bounding_box.zmax
 
-bottom = mesh.find_nodes("Z", zmin, tol=1e-8)
-top = mesh.find_nodes("Z", zmax, tol=1e-8)
 
-pb.bc.add("Dirichlet", bottom, "Disp", 0.0)
-pb.bc.add("Dirichlet", top, "DispZ", -0.8)
+# boundary conditions
+pb.bc.add("Dirichlet", nodes_left, "Disp", 0)
+pb.bc.add("Dirichlet", nodes_bc, "Disp", [-0.05, 0.025])
+# set newton-raphson convergence criterion
+pb.set_nr_criterion("Displacement", tol=5e-3, max_subiter=15)
 
-pb.apply_boundary_conditions()
-pb.solve()
 
-results_nucleus = pb.get_results(assembly_nucleus,output_list=["Stress", "Disp", "Strain"])
+# solve load step
+pb.nlsolve(dt=0.05, tmax=1, update_dt=True, print_info=1, interval_output=0.1, dt_min=1e-8)
+n_iter_load = results.n_iter
 
-results_annulus = pb.get_results(assembly_annulus,output_list=["Stress", "Disp", "Strain"])
 
-plotter = results_nucleus.plot("stress", "vm",show=False)
-results_annulus.plot("stress", "vm",plotter=plotter)
+# change boundary condition (unload)
+pb.bc.remove(-1)  # remove last boundary condition
+pb.bc.add("Dirichlet", nodes_bc, "Disp", [0, 0])
 
-plotter.show()
+
+# solve unload step
+pb.nlsolve(dt=0.05, tmax=1, update_dt=True, print_info=1, interval_output=0.1, dt_min=1e-8)
+
+
+results.load(n_iter_load - 1)  # load state at the end of load
+results.plot("Stress", "vm", "Node", show=True, scale=1, show_nodes=True)
+results.load(-1)  # load state at the end of unload
+results.plot("Stress", "XX", "Node", show=True, scale=1, show_nodes=True)
+
+#remarque:
+# "Stress" = champ de contrainte
+# "vm" = composante Von Mises
+#"Node" = affichage/interpolation aux nœuds 
